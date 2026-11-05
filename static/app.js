@@ -1,6 +1,6 @@
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function localDate(){const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
-let today=localDate(),day=today,mode=localStorage.getItem('word-journal-mode')||'zh',scope='mine',data={words:[],dates:[],entries:[],reviews:[]},revealed=new Set(),order=[],previewText='',previewRows=[],searchId=0;
+let today=localDate(),day=today,mode=localStorage.getItem('word-journal-mode')||'zh',scope='mine',data={words:[],dates:[],entries:[],reviews:[]},revealed=new Set(),previewText='',previewRows=[],searchId=0;
 if(!['zh','en','none'].includes(mode))mode='zh';
 async function api(url,body){let r=await fetch(url,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});let j=await r.json();if(!r.ok)throw Error(j.error||'请求失败');return j}
 function toast(s){$('#toast').textContent=s;$('#toast').classList.add('visible');clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').classList.remove('visible'),4000)}
@@ -9,13 +9,13 @@ function enterList(){if(!motionOK())return;document.querySelectorAll('#study-lis
 const routes={study:'/',review:'/review',daily:'/daily',library:'/vocabulary',import:'/import',practice:'/practice','practice-session':'/practice/session'};
 let navigationId=0;
 async function page(name,{fromHistory=false,replace=false}={}){
+ pronunciation.stop();
  if(!routes[name])name='study';
  if(name==='practice-session'&&!practice.queue.length){name='practice';replace=true}
  if(location.pathname!==routes[name])history[replace||fromHistory?'replaceState':'pushState']({page:name},'',routes[name]);
  document.documentElement.dataset.focus=String(name==='practice-session');document.documentElement.dataset.current=name;
  document.querySelectorAll('.primary-nav a').forEach(a=>{const active=a.dataset.routePage===(name==='practice-session'?'practice':name);a.classList.toggle('active',active);if(active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});
  document.title=({study:'首页',review:'词汇背诵',daily:'每日记词',library:'词汇与词典',import:'导入新词',practice:'练习设置','practice-session':'专注练习'}[name])+' · 拾词';
- if(name!=='practice-session')window.speechSynthesis?.cancel();
 
  const token=++navigationId,current=document.querySelector('.page:not([hidden])'),next=$('#'+name);
  document.querySelectorAll('.nav').forEach(x=>{x.classList.toggle('active',x.dataset.page===name);x.setAttribute('aria-current',x.dataset.page===name?'page':'false')});
@@ -43,7 +43,15 @@ async function setTheme(theme){
 themeControls();
 
 function meta(w){return `<span class="badge">首次记录 ${esc(w.first_date)}</span><span class="badge">记录距今 ${w.age_days} 天</span><span class="badge">已学习 ${w.study_days} 天</span>${w.last_studied?`<span class="badge">上次学习 ${esc(w.last_studied)}</span>`:''}`}
-async function refresh(){today=localDate();data=await api('/api/state?today='+today);if(day!==today){data.selectedEntries=(await api('/api/state?today='+day)).entries}order=[];render();if(!$('#library').hidden)renderSearch()}
+async function refresh(){today=localDate();data=await api('/api/state?today='+today);if(day!==today){data.selectedEntries=(await api('/api/state?today='+day)).entries}render();if(!$('#library').hidden)renderSearch()}
+// Keep a separate shuffle for each date within the current browser tab.
+function reviewOrderKey(){return 'word-journal-review-order:'+day}
+function reviewOrder(){
+ try{
+  const order=JSON.parse(sessionStorage.getItem(reviewOrderKey())||'[]');
+  return Array.isArray(order)?order:[];
+ }catch{return []}
+}
 function render(){
  $('#today-label').textContent=new Date(today+'T12:00:00').toLocaleDateString('zh-CN',{year:'numeric',month:'long',day:'numeric',weekday:'long'});
  $('#dates').innerHTML=data.dates.map(d=>`<button class="date-link ${d.day===day?'active':''}" data-date="${d.day}"><span>${d.day===today?'今天 · ':''}${d.day}</span><small>${d.count}</small></button>`).join('')||'<p class="word-meta">新词会在这里留下足迹</p>';
@@ -52,7 +60,11 @@ function render(){
  $('#home-count').textContent=`今日 ${data.entries.length} 词 · 累计 ${data.words.length} 词`;
  const ids=day===today?data.entries:(data.selectedEntries||[]);
  let list=ids.map(id=>data.words.find(w=>w.word===id)).filter(Boolean);
- if(order.length)list.sort((a,b)=>order.indexOf(a.word)-order.indexOf(b.word));
+ const order=reviewOrder();
+ if(order.length){
+  const rank=new Map(order.map((word,i)=>[word,i]));
+  list.sort((a,b)=>(rank.get(a.word)??order.length)-(rank.get(b.word)??order.length));
+ }
  const firstPaint=!$('#stats').children.length;
  const reviewed=new Set(data.reviews.filter(r=>ids.includes(r.word)&&r.direction===mode).map(r=>r.word));
  $('#stats').innerHTML=[['这一天记录',list.length,'个词汇'],['今天已复习',reviewed.size,'个词汇'],['累计收藏',data.words.length,'个词汇']].map(([l,n,u])=>`<div class="stat"><div class="stat-label">${l}</div><div class="stat-value">${n}<small>${u}</small></div></div>`).join('');
@@ -60,20 +72,60 @@ function render(){
  $('#study-list').innerHTML=list.length?list.map((w,i)=>{
  const show=revealed.has(w.word),r=data.reviews.find(r=>r.word===w.word&&r.direction===mode);
  const mask=`<button class="mask" data-reveal="${esc(w.word)}" aria-label="显示${mode==='zh'?'中文':'英文'}答案">••• 点击查看${mode==='zh'?'释义':'英文'}</button>`;
- return `<article class="word-card"><span class="number">${String(i+1).padStart(2,'0')}</span><div>${mode==='en'&&!show?mask:`<div class="english">${esc(w.word)}</div>`}<div class="word-meta">已学习 ${w.study_days} 天 · 记录 ${w.age_days} 天</div></div><div>${mode==='zh'&&!show?mask:`<div class="pos">${esc(w.pos)}</div><div class="meaning">${esc(w.meaning)}</div>`}</div><div class="review-actions"><button class="again ${r?.result==='again'?'active':''}" data-review="${esc(w.word)}" data-result="again" ${mode!=='none'&&!show?'disabled':''}>再记一次</button><button class="known ${r?.result==='known'?'active':''}" data-review="${esc(w.word)}" data-result="known" ${mode!=='none'&&!show?'disabled':''}>✓ 记住了</button></div></article>`}).join(''):`<div class="empty"><span style="font:40px Georgia">Aa</span><b>这一天还没有词汇</b><p>导入词汇后开始背诵。</p><button class="primary" data-open-import>＋ 记录新词</button></div>`;
+ return `<article class="word-card"><span class="number">${String(i+1).padStart(2,'0')}</span><div class="review-pronunciation"><div class="review-word-heading">${mode==='en'&&!show?mask:`<div class="english" lang="en">${esc(w.word)}</div>`}${wordSpeechButton('data-review-speak')}</div><div class="word-meta">已学习 ${w.study_days} 天 · 记录 ${w.age_days} 天</div></div><div>${mode==='zh'&&!show?mask:`<div class="pos">${esc(w.pos)}</div><div class="meaning">${esc(w.meaning)}</div>`}</div><div class="review-actions"><button class="again ${r?.result==='again'?'active':''}" data-review="${esc(w.word)}" data-result="again" ${mode!=='none'&&!show?'disabled':''}>再记一次</button><button class="known ${r?.result==='known'?'active':''}" data-review="${esc(w.word)}" data-result="known" ${mode!=='none'&&!show?'disabled':''}>✓ 记住了</button></div></article>`}).join(''):`<div class="empty"><span style="font:40px Georgia">Aa</span><b>这一天还没有词汇</b><p>导入词汇后开始背诵。</p><button class="primary" data-open-import>＋ 记录新词</button></div>`;
  $('#progress-label').textContent=`本轮进度 · ${reviewed.size} / ${list.length}`;$('#progress-fill').style.width=`${list.length?reviewed.size/list.length*100:0}%`;
  if(firstPaint)enterList();
  $('#dict-state').textContent=`● 本地词库就绪 · ${data.dictionary_count.toLocaleString()} 条释义 · 离线可查`;
 }
-async function selectDay(d){day=d;revealed.clear();order=[];if(d!==today){const s=await api('/api/state?today='+d);data.selectedEntries=s.entries}page('review');render()}
+async function selectDay(d){day=d;revealed.clear();if(d!==today){const s=await api('/api/state?today='+d);data.selectedEntries=s.entries}page('review');render()}
 async function renderSearch(){const id=++searchId,q=$('#search').value.trim();document.querySelectorAll('[data-scope]').forEach(b=>b.classList.toggle('selected',b.dataset.scope===scope));
  if(scope==='mine'){const list=data.words.filter(w=>!q||w.word.toLowerCase().includes(q.toLowerCase())||w.meaning.includes(q));$('#search-caption').textContent=`我的词汇 · ${list.length} 个结果`;
- $('#search-results').innerHTML=list.map(w=>`<article class="result"><div class="result-content"><div class="english">${esc(w.word)}</div>${meta(w)}<div class="meaning">${esc(w.pos)} ${esc(w.meaning)}</div></div><div><button class="quiet" data-add="${esc(w.word)}" ${w.in_today?'disabled':''}>${w.in_today?'已在今日记录':'＋ 加入今日新记'}</button></div></article>`).join('')||`<div class="empty"><b>${q?'没有找到记录过的词':'还没有记录词汇'}</b><p>可切换到 ECDICT 本地词典查找新词。</p></div>`;return}
+ $('#search-results').innerHTML=list.map(w=>`<article class="result"><div class="result-content"><div class="english">${esc(w.word)}</div>${meta(w)}<div class="meaning">${esc(w.pos)} ${esc(w.meaning)}</div></div><div class="word-result-actions"><button class="quiet" data-manage-word="${esc(w.word)}">管理词汇</button><button class="quiet" data-add="${esc(w.word)}" ${w.in_today?'disabled':''}>${w.in_today?'已在今日记录':'＋ 加入今日新记'}</button></div></article>`).join('')||`<div class="empty"><b>${q?'没有找到记录过的词':'还没有记录词汇'}</b><p>可切换到 ECDICT 本地词典查找新词。</p></div>`;return}
  $('#search-caption').textContent=`ECDICT 社区开源词库 · ${data.dictionary_count.toLocaleString()} 条 · 输入英文查词`;
  if(!q){$('#search-results').innerHTML='<div class="empty"><b>输入英文查词</b><p>输入英文单词或前缀，查询本地词典。</p></div>';return}
  $('#search-results').innerHTML='<p class="sub">正在查找…</p>';
  const list=await api('/api/search?q='+encodeURIComponent(q));if(id!==searchId)return;
  $('#search-results').innerHTML=list.map(w=>{const mine=data.words.find(x=>x.word===w.word);return `<article class="result"><div class="result-content"><div class="english">${esc(w.word)} <span class="word-meta">${esc(w.phonetic)}</span></div>${mine?meta(mine):'<span class="badge warn">尚未记录</span>'}<div class="meaning">${esc(w.meaning)}</div></div><div><button class="quiet" data-add="${esc(w.word)}" ${mine?.in_today?'disabled':''}>${mine?.in_today?'已在今日记录':'＋ 加入今日新记'}</button></div></article>`}).join('')||'<div class="empty"><b>词库暂未收录</b><p>在导入新词中填写英文和中文释义，即可自行记录。</p></div>';
+}
+async function openWordManager(word,trigger){
+ const dialog=$('#word-manager');trigger.disabled=true;
+ try{
+  const w=await api('/api/word?word='+encodeURIComponent(word));
+  if($('#library').hidden||scope!=='mine'||dialog.open)return;
+  dialog.innerHTML=`<form>
+   <h2 id="word-manager-title">管理词汇 <span class="english" lang="en">${esc(w.word)}</span></h2>
+   <label>词性<input name="pos" value="${esc(w.pos)}" placeholder="如 v&n."></label>
+   <label>释义<textarea name="meaning" rows="3" required>${esc(w.meaning)}</textarea></label>
+   <div class="word-manager-dates"><strong>记录日期</strong><p class="word-meta">${w.days.map(esc).join(' · ')||'暂无日期记录'}</p>
+    <label>日期操作<select name="from_day"><option value="">添加到指定日期</option>${w.days.map(d=>`<option value="${esc(d)}">移动 ${esc(d)} 的记录</option>`).join('')}</select></label>
+    <label>目标日期<input name="day" type="date" max="${localDate()}"></label>
+    <p class="word-meta">只修改释义时可留空。移动记录会保留学习历史。</p>
+   </div>
+   <p class="error-text" role="alert" hidden></p>
+   <div class="word-manager-actions"><button class="quiet word-delete" type="button" data-request-delete>删除词汇</button><button class="quiet" type="button" data-manager-close>取消</button><button class="primary" type="submit">保存</button></div>
+   <div class="word-delete-confirm" hidden><p>删除「${esc(w.word)}」及其所有日期和学习记录？</p><button class="quiet" type="button" data-cancel-delete>返回</button> <button class="quiet word-delete" type="button" data-confirm-delete>确认删除</button></div>
+  </form>`;
+  const form=dialog.querySelector('form'),fields=form.elements,error=form.querySelector('[role=alert]'),confirm=form.querySelector('.word-delete-confirm');
+  let busy=false;
+  const submit=async(action)=>{
+   if(busy)return;busy=true;error.hidden=true;
+   const body={action,word:w.word,...Object.fromEntries(new FormData(form))};
+   const controls=[...form.querySelectorAll('button,input,select,textarea')];controls.forEach(el=>el.disabled=true);
+   try{
+    await api('/api/word',body);
+    dialog.close();toast(action==='delete'?'词汇已删除':'词汇已更新');await refresh().catch(e=>toast('刷新词汇失败：'+e.message));
+   }catch(e){error.textContent=e.message;error.hidden=false}
+   finally{busy=false;controls.forEach(el=>el.disabled=false)}
+  };
+  form.onsubmit=e=>{e.preventDefault();submit('save')};
+  fields.from_day.onchange=()=>{fields.day.required=Boolean(fields.from_day.value)};
+  form.querySelector('[data-manager-close]').onclick=()=>dialog.close();
+  form.querySelector('[data-request-delete]').onclick=()=>{confirm.hidden=false;form.querySelector('[data-cancel-delete]').focus()};
+  form.querySelector('[data-cancel-delete]').onclick=()=>{confirm.hidden=true;form.querySelector('[data-request-delete]').focus()};
+  form.querySelector('[data-confirm-delete]').onclick=()=>submit('delete');
+  dialog.oncancel=e=>{if(busy)e.preventDefault()};
+  dialog.showModal();
+ }finally{trigger.disabled=false}
 }
 async function preview(){previewText=$('#input').value;previewRows=await api('/api/preview',{text:previewText});$('#preview-area').hidden=false;const good=previewRows.filter(r=>!r.error);$('#preview-caption').textContent=`识别结果 · 可导入 ${good.length} 行${previewRows.length-good.length?` / 待修正 ${previewRows.length-good.length} 行`:''}`;$('#commit').disabled=!good.length;$('#commit').textContent='确认导入有效词汇';$('#preview-results').innerHTML=previewRows.map(r=>`<div class="result ${r.error?'preview-error':''}"><div class="result-content"><div class="english">${esc(r.word||r.raw)}</div><div class="meaning">${esc(r.pos)} ${esc(r.meaning)}</div>${r.error?`<p class="error-text">第 ${r.line} 行：${esc(r.error)}</p>`:`<span class="badge">${esc(r.source)}</span>`}</div></div>`).join('')||'<div class="empty">请先填写词汇。</div>'}
 async function action(e){const b=e.target.closest('button');if(!b)return;
@@ -82,7 +134,12 @@ async function action(e){const b=e.target.closest('button');if(!b)return;
  if(b.hasAttribute('data-open-import'))return page('import');
  if(b.dataset.date){document.querySelector('.history-picker')?.removeAttribute('open');return selectDay(b.dataset.date)}
  if(b.dataset.mode){mode=b.dataset.mode;localStorage.setItem('word-journal-mode',mode);revealed.clear();render();enterList();return}
+ if(b.dataset.manageWord)return openWordManager(b.dataset.manageWord,b);
  if(b.dataset.scope){scope=b.dataset.scope;return renderSearch()}
+ if(b.hasAttribute('data-review-speak')){
+  const word=b.closest('.word-card')?.querySelector('.known[data-review]')?.dataset.review;
+  if(word)return pronunciation.play(word,b);
+ }
  if(b.dataset.reveal){
  const word=b.dataset.reveal,w=data.words.find(x=>x.word===word),card=b.closest('.word-card'),cell=b.parentElement;
  if(!w)return;revealed.add(word);const oldHeight=card.getBoundingClientRect().height;
@@ -112,7 +169,13 @@ async function action(e){const b=e.target.closest('button');if(!b)return;
 }
 document.addEventListener('click',e=>action(e).catch(err=>toast(err.message)));
 $('#go-import').onclick=()=>page('import');$('#date').onchange=()=>selectDay($('#date').value).catch(e=>toast(e.message));
-$('#shuffle').onclick=()=>{order=[...$('#study-list').querySelectorAll('[data-reveal],[data-review]')].map(b=>b.dataset.reveal||b.dataset.review).filter((v,i,a)=>a.indexOf(v)===i);for(let i=order.length-1;i>0;i--){let j=Math.floor(Math.random()*(i+1));[order[i],order[j]]=[order[j],order[i]]}render();enterList()};
+$('#shuffle').onclick=()=>{
+ const words=[...$('#study-list').querySelectorAll('.word-card .known[data-review]')].map(b=>b.dataset.review);
+ if(words.length<2)return;
+ const next=shuffled(words);
+ if(next.every((word,i)=>word===words[i]))next.push(next.shift());
+ sessionStorage.setItem(reviewOrderKey(),JSON.stringify(next));render();enterList();
+};
 let timer;$('#search').oninput=()=>{++searchId;clearTimeout(timer);timer=setTimeout(()=>renderSearch().catch(e=>toast(e.message)),200)};
 $('#preview').onclick=()=>preview().catch(e=>toast(e.message));$('#input').oninput=()=>{$('#preview-area').hidden=true};
 $('#commit').onclick=async()=>{const b=$('#commit');b.disabled=true;try{if(previewText!==$('#input').value)throw Error('内容已修改，请重新预览');const d=$('#import-date').value;const result=await api('/api/import',{text:previewText,day:d});await refresh();await selectDay(d);toast(`已记录 ${result.count} 个词汇${result.skipped?`，${result.skipped} 行未导入，请修正`:''}`);$('#input').value=previewRows.filter(r=>r.error).map(r=>r.raw).join('\n');$('#preview-area').hidden=true}catch(e){toast(e.message)}finally{b.disabled=false}};
@@ -134,24 +197,27 @@ $('#practice-date').value=today;$('#practice-date').max=today;
 function shuffled(items){const a=[...items];for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a}
 function practiceQueue(words,type){const count=Math.floor(words.length/2)+(words.length%2?Math.round(Math.random()):0);return shuffled(words).map((w,i)=>({w,type:type==='mixed'?(i<count?'en':'zh'):type}))}
 function practiceAnimate(){if(motionOK())$('#practice-stage').animate([{opacity:0,transform:'translateY(8px)'},{opacity:1,transform:'translateY(0)'}],{duration:320,easing:'cubic-bezier(.22,1,.36,1)'})}
-function speakPractice(){
- const item=practice.queue[practice.index];if(!item)return;
- if(!('speechSynthesis' in window)){toast('当前浏览器不支持朗读，请使用 Chrome 或 Safari，或切换到默写模式');return}
- speechSynthesis.cancel();const utterance=new SpeechSynthesisUtterance(item.w.word);utterance.lang='en-US';utterance.rate=.85;
- const voice=speechSynthesis.getVoices().find(v=>v.lang==='en-US')||speechSynthesis.getVoices().find(v=>v.lang.startsWith('en'));
- if(voice)utterance.voice=voice;
- utterance.onerror=e=>{if(!['canceled','interrupted'].includes(e.error))toast('发音暂不可用，请检查系统英文语音，或切换到默写模式')};
- speechSynthesis.speak(utterance);
+function speakPractice(){const item=practice.queue[practice.index];if(item)pronunciation.play(item.w.word,$('#practice-speak'))}
+function wordSpeechButton(attribute){
+ return `<button type="button" class="daily-speak" ${attribute} aria-label="播放英文发音" title="播放英文发音"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg></button>`;
+}
+function practiceAnswerWord(word){
+ return `<div class="practice-answer-word"><div class="english" lang="en">${esc(word)}</div>${wordSpeechButton('data-answer-speak')}</div>`;
+}
+function bindAnswerSpeech(container,word){
+ const button=container?.querySelector('[data-answer-speak]');
+ if(button)button.onclick=()=>pronunciation.play(word,button);
 }
 function showPractice(){
+ pronunciation.stop();
  const item=practice.queue[practice.index];practice.checked=false;
  $('#session-source').textContent=practice.date;
  if(!item){$('#practice-stage').innerHTML=`<div class="empty practice-done"><b>全部完成</b><p>掌握 ${practice.known} 词 · 错词补练 ${practice.again} 次</p><button class="quiet" id="practice-prev">← 上一词 <kbd>Tab</kbd></button> <button class="primary" id="practice-restart">重新开始</button></div>`;$('#practice-restart').onclick=startPractice;$('#practice-prev').disabled=!practice.attempts.length;$('#practice-prev').onclick=previousPractice;practiceAnimate();completePracticeFlow();return}
  const {w,type}=item,zh=type==='en',audio=type==='audio',immediate=practice.retryIndex===practice.index;
- $('#practice-stage').innerHTML=`<div class="session-progress"><span>第 ${practice.turn} 轮 · 成功 ${practice.turnSuccess} / 10 · 总掌握 ${practice.known} / ${practice.originalCount}</span><div class="progress-track"><i style="width:${practice.turnSuccess/10*100}%"></i></div></div><article class="practice-card panel"><div class="practice-question-label"><span>${audio?'英文听写':zh?'看英文 · 写中文':'看中文 · 写英文'}</span><span>${practice.deferred.length?`下轮补练 ${practice.deferred.length} 词`:``}</span></div>${audio?'<button class="audio-play" id="practice-speak" aria-label="播放英文发音">▷ <span>点击播放 · 可重复听</span></button>':`<div class="practice-prompt ${zh?'english':'meaning'}">${esc(zh?w.word:w.meaning)}</div>`}${immediate?`<div class="immediate-retry-note">立即重记 · 不计本轮成功，下一轮再考</div><details class="immediate-reference" open><summary>参考答案（点击收起）</summary><div class="english">${esc(w.word)}</div><div class="meaning">${esc(w.meaning)}</div></details>`:''}<form id="practice-form"><label for="practice-answer" class="word-meta">${zh?'输入你记得的中文释义':'输入英文单词或短语'}</label><input id="practice-answer" class="practice-answer" placeholder="${zh?'写下中文释义…':'Type your answer…'}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ${zh?'':'lang="en"'}><div class="practice-submit"><span class="word-meta">Enter 提交 / 下一词</span><button type="submit" class="primary">提交 / 查看答案 <kbd>Enter</kbd></button></div></form><div id="practice-feedback" aria-live="polite" hidden></div><div class="practice-navigation"><button class="quiet" id="practice-prev" ${practice.attempts.length?'':'disabled'}>← 上一词 <kbd>Tab</kbd></button><button class="quiet" id="practice-skip" title="${immediate?'本次只结束立即重记，不计成功；下轮仍会再考':'直接记为已掌握，计入本轮成功数，不加入错词补练'}">${immediate?'结束重记（不计成功）':'跳过（计为已掌握）'} <kbd>Shift+Enter</kbd></button></div></article>`;
+ $('#practice-stage').innerHTML=`<div class="session-progress"><span>第 ${practice.turn} 轮 · 成功 ${practice.turnSuccess} / 10 · 总掌握 ${practice.known} / ${practice.originalCount}</span><div class="progress-track"><i style="width:${practice.turnSuccess/10*100}%"></i></div></div><article class="practice-card panel"><div class="practice-question-label"><span>${audio?'英文听写':zh?'看英文 · 写中文':'看中文 · 写英文'}</span><span>${practice.deferred.length?`下轮补练 ${practice.deferred.length} 词`:``}</span></div>${audio?'<button class="audio-play" id="practice-speak" aria-label="播放英文发音">▷ <span>点击播放 · 可重复听</span></button>':`<div class="practice-prompt ${zh?'english':'meaning'}">${esc(zh?w.word:w.meaning)}</div>`}${immediate?`<div class="immediate-retry-note">立即重记 · 不计本轮成功，下一轮再考</div><details class="immediate-reference"${type==='zh'?'':' open'}><summary>参考答案</summary>${practiceAnswerWord(w.word)}${type==='zh'?'':`<div class="meaning">${esc(w.meaning)}</div>`}</details>`:''}<form id="practice-form"><label for="practice-answer" class="word-meta">${zh?'输入你记得的中文释义':'输入英文单词或短语'}</label><input id="practice-answer" class="practice-answer" placeholder="${zh?'写下中文释义…':'Type your answer…'}" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ${zh?'':'lang="en"'}><div class="practice-submit"><span class="word-meta">Enter 提交 / 下一词</span><button type="submit" class="primary">提交 / 查看答案 <kbd>Enter</kbd></button></div></form><div id="practice-feedback" aria-live="polite" hidden></div><div class="practice-navigation"><button class="quiet" id="practice-prev" ${practice.attempts.length?'':'disabled'}>← 上一词 <kbd>Tab</kbd></button><button class="quiet" id="practice-skip" title="${immediate?'本次只结束立即重记，不计成功；下轮仍会再考':'直接记为已掌握，计入本轮成功数，不加入错词补练'}">${immediate?'结束重记（不计成功）':'跳过（计为已掌握）'} <kbd>Shift+Enter</kbd></button></div></article>`;
  $('#practice-prev').onclick=previousPractice;$('#practice-skip').onclick=()=>gradePractice('known',true);
  $('#practice-form').onsubmit=e=>{e.preventDefault();checkPractice()};if(audio)$('#practice-speak').onclick=speakPractice;
- practiceAnimate();$('#practice-answer').focus({preventScroll:true});
+ bindAnswerSpeech($('.immediate-reference'),w.word);practiceAnimate();$('#practice-answer').focus({preventScroll:true});
 }
 function normalizeSpelling(s){return s.normalize('NFKC').toLowerCase().replace(/[’‘]/g,"'").trim().replace(/\s+/g,' ')}
 function checkPractice(){
@@ -159,7 +225,8 @@ function checkPractice(){
  const {w,type}=practice.queue[practice.index],answer=$('#practice-answer').value.trim(),needsChinese=type==='en',correct=!needsChinese&&normalizeSpelling(answer)===normalizeSpelling(w.word);
  $('#practice-answer').readOnly=true;$('#practice-form button[type=submit]').hidden=true;
  const feedback=$('#practice-feedback');feedback.hidden=false;
- feedback.innerHTML=`<div class="practice-verdict ${correct?'correct':''}">${needsChinese?'对照参考释义，自评是否掌握':correct?'✓ 拼写正确':answer?'再对照一下英文拼写':'先看看答案，再巩固一次'}</div><div class="practice-reference"><div class="english">${esc(w.word)}</div><div class="pos">${esc(w.pos)}</div><div class="meaning">${esc(w.meaning)}</div></div><div class="practice-grades"><button class="quiet" data-practice-grade="again">再记一次 <kbd>～${!needsChinese&&!correct?' / Enter':''}</kbd></button><button class="primary" data-practice-grade="known">${practice.retryIndex===practice.index?'重记完成，下一词':correct?'记住了，下一题':'我已掌握，下一题'} ${needsChinese||correct?'<kbd>Enter</kbd>':''}</button></div>`;
+ feedback.innerHTML=`<div class="practice-verdict ${correct?'correct':''}">${needsChinese?'对照参考释义，自评是否掌握':correct?'✓ 拼写正确':answer?'再对照一下英文拼写':'先看看答案，再巩固一次'}</div><div class="practice-reference">${practiceAnswerWord(w.word)}<div class="pos">${esc(w.pos)}</div><div class="meaning">${esc(w.meaning)}</div></div><div class="practice-grades"><button class="quiet" data-practice-grade="again">再记一次 <kbd>～${!needsChinese&&!correct?' / Enter':''}</kbd></button><button class="primary" data-practice-grade="known">${practice.retryIndex===practice.index?'重记完成，下一词':correct?'记住了，下一题':'我已掌握，下一题'} ${needsChinese||correct?'<kbd>Enter</kbd>':''}</button></div>`;
+ bindAnswerSpeech(feedback,w.word);
  feedback.querySelectorAll('[data-practice-grade]').forEach(b=>b.onclick=()=>gradePractice(b.dataset.practiceGrade));
  if(motionOK())feedback.animate([{opacity:0,transform:'translateY(8px)'},{opacity:1,transform:'translateY(0)'}],{duration:300,easing:'ease-out'});
  feedback.querySelector(`[data-practice-grade="${correct?'known':'again'}"]`).focus({preventScroll:true});
@@ -169,12 +236,12 @@ async function gradePractice(result,skipped=false){
  const item=practice.queue[practice.index];const buttons=$('#practice-stage').querySelectorAll('button');buttons.forEach(b=>b.disabled=true);
  try{
   await api('/api/review',{word:item.w.word,day:localDate(),direction:item.type==='audio'?'listening':item.type==='en'?'dictation_zh':'dictation_en',result:practice.retryIndex===practice.index?'again':result});
-  const outcome=settlePractice(practice,result,{answer:$('#practice-answer').value,skipped});savePracticeSession();window.speechSynthesis?.cancel();showPractice();if(outcome.celebrate)celebrateTurn(outcome.completedTurn);
+  const outcome=settlePractice(practice,result,{answer:$('#practice-answer').value,skipped});savePracticeSession();showPractice();if(outcome.celebrate)celebrateTurn(outcome.completedTurn);
  }catch(e){toast('学习记录保存失败：'+e.message);buttons.forEach(b=>b.disabled=false)}finally{practice.busy=false}
 }
 function previousPractice(){
  if(practice.busy)return;undoCompletionFlow();const attempt=rewindPractice(practice);if(!attempt)return;
- window.speechSynthesis?.cancel();document.querySelector('.celebration')?.remove();savePracticeSession();showPractice();$('#practice-answer').value=attempt.answer||'';
+ document.querySelector('.celebration')?.remove();savePracticeSession();showPractice();$('#practice-answer').value=attempt.answer||'';
 }
 function celebrateTurn(turn){
  document.querySelector('.celebration')?.remove();const layer=document.createElement('div');layer.className='celebration';layer.setAttribute('role','status');layer.innerHTML=`<div class="celebration-label">第 ${turn} 轮完成 <strong>10 词已掌握</strong></div>`;document.body.append(layer);
@@ -215,7 +282,7 @@ document.addEventListener('keydown',e=>{
  const next=e.key==='Enter'&&!e.shiftKey;
  if(!previous&&!again&&!next&&!skip)return;
  // Navigation and theme controls retain their normal Enter behavior.
- if(next&&e.target.closest('button')&&!e.target.closest('#practice-stage'))return;
+ if(next&&(e.target.closest('[data-answer-speak],.immediate-reference summary')||(e.target.closest('button')&&!e.target.closest('#practice-stage'))))return;
  if(!practice.queue[practice.index]&&!previous)return;
  e.preventDefault();e.stopImmediatePropagation();
  if(e.repeat||practice.busy)return;

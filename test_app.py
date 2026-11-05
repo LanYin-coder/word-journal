@@ -27,6 +27,13 @@ class JournalTests(unittest.TestCase):
   self.assertEqual(row['pos'],'v&n.');self.assertEqual(row['meaning'],'记录，录音')
   row=server.parse('record v&n.记录 adj.创纪录的')[0]
   self.assertEqual(row['pos'],'v&n./adj.');self.assertEqual(row['meaning'],'记录 adj.创纪录的')
+ def test_daily_phonetics_from_dictionary(self):
+  with server.connect() as c:
+   c.execute('INSERT INTO words VALUES(?,?,?,?)',('seek','寻找','v.','2026-01-01'))
+   c.execute('INSERT INTO words VALUES(?,?,?,?)',('unknownword','自定义词','n.','2026-01-01'))
+  words={w['word']:w for w in server.state('2026-01-02')['words']}
+  self.assertEqual(words['seek']['phonetic'],'si:k')
+  self.assertEqual(words['unknownword']['phonetic'],'')
  def test_daily_progress(self):
   with server.connect() as c:
    c.execute('INSERT INTO words VALUES(?,?,?,?)',('seek','寻找','v.','2026-01-01'))

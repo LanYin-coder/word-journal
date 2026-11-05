@@ -1,4 +1,5 @@
 import csv, io, json, os, re, sqlite3, argparse
+import pronunciation
 from pathlib import Path
 from datetime import date
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -64,23 +65,69 @@ def parse(text):
 
 def state(day):
     with connect() as c:
-        words=[dict(r) for r in c.execute('''SELECT w.*, (SELECT count(DISTINCT day) FROM reviews WHERE word=w.word) study_days,
+        words=[dict(r) for r in c.execute('''SELECT w.*, COALESCE(d.phonetic, '') phonetic, (SELECT count(DISTINCT day) FROM reviews WHERE word=w.word) study_days,
           (SELECT max(day) FROM reviews WHERE word=w.word) last_studied,
           (SELECT count(*) FROM entries WHERE word=w.word) recorded_days,
           EXISTS(SELECT 1 FROM entries WHERE word=w.word AND day=?) in_today
-          FROM words w ORDER BY first_date DESC, word''',(day,))]
+          FROM words w LEFT JOIN dictionary d ON d.word=w.word ORDER BY first_date DESC, w.word''',(day,))]
         for w in words:
             w['age_days']=(date.fromisoformat(day)-date.fromisoformat(w['first_date'])).days
         return {'words':words,'dates':[dict(r) for r in c.execute('SELECT day,count(*) count FROM entries GROUP BY day ORDER BY day DESC')],
                 'entries':[r[0] for r in c.execute('SELECT word FROM entries WHERE day=? ORDER BY rowid',(day,))],
                 'reviews':[dict(r) for r in c.execute('SELECT * FROM reviews WHERE day=?',(day,))],
                 'dictionary_count':c.execute('SELECT count(*) FROM dictionary').fetchone()[0]}
+def word_details(word):
+    with connect() as c:
+        row=c.execute('SELECT word, pos, meaning FROM words WHERE word=?',(word,)).fetchone()
+        if row is None: raise ValueError('词汇未记录')
+        return {**dict(row),'days':[r[0] for r in c.execute('SELECT day FROM entries WHERE word=? ORDER BY day DESC',(word,))]}
+
+def manage_word(body):
+    with connect() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row=c.execute('SELECT word FROM words WHERE word=?',(body['word'],)).fetchone()
+        if row is None: raise ValueError('词汇未记录')
+        word=row['word']
+        if body.get('action')=='delete':
+            for table in ('reviews','entries','words'):
+                c.execute('DELETE FROM '+table+' WHERE word=?',(word,))
+            return
+        if body.get('action')!='save': raise ValueError('无效操作')
+        meaning=body['meaning'].strip()
+        pos=body['pos'].strip()
+        if not meaning: raise ValueError('请填写释义')
+        target=body.get('day')
+        source=body.get('from_day')
+        if source and not target: raise ValueError('请选择要移到的日期')
+        if target:
+            target=valid_day(target)
+            if source:
+                valid_day(source)
+                if not c.execute('SELECT 1 FROM entries WHERE word=? AND day=?',(word,source)).fetchone():
+                    raise ValueError('原日期记录已不存在，请重新打开管理窗口')
+                if source!=target:
+                    c.execute('DELETE FROM entries WHERE word=? AND day=?',(word,source))
+            c.execute('INSERT OR IGNORE INTO entries VALUES(?,?)',(word,target))
+            c.execute('UPDATE words SET first_date=(SELECT min(day) FROM entries WHERE word=?) WHERE word=?',(word,word))
+        c.execute('UPDATE words SET pos=?, meaning=? WHERE word=?',(pos,meaning,word))
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,obj,status=200):
         data=json.dumps(obj,ensure_ascii=False).encode(); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         u=urlparse(self.path); q=parse_qs(u.query)
         try:
+            if u.path in ('/api/pronunciation', '/api/pronunciation/audio'):
+                word=q.get('word',[''])[0]
+                try:
+                    if u.path.endswith('/audio'):
+                        audio,mime=pronunciation.audio_file(word)
+                        self.send_response(200); self.send_header('Content-Type',mime); self.send_header('Content-Length',str(len(audio))); self.send_header('Cache-Control','private, max-age=86400'); self.end_headers(); self.wfile.write(audio)
+                        return
+                    return self.send_json([pronunciation.recording(word)])
+                except Exception:
+                    return self.send_json({'error':'词典录音暂不可用'},503)
+            if u.path=='/api/word': return self.send_json(word_details(q.get('word',[''])[0]))
             if u.path=='/api/state': return self.send_json(state(valid_day(q.get('today',[date.today().isoformat()])[0])))
             if u.path=='/api/search':
                 term=q.get('q',[''])[0].strip()
@@ -89,7 +136,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(rows)
             if u.path=='/api/export':
                 with connect() as c: return self.send_json({'version':1,**{t:[dict(r) for r in c.execute('SELECT * FROM '+t)] for t in ('words','entries','reviews')}})
-            paths={**{route:'index.html' for route in ('/','/daily','/review','/vocabulary','/import','/practice','/practice/session')},'/app.js':'app.js','/practice-engine.js':'practice-engine.js','/learning-flow.js':'learning-flow.js','/daily-browser.js':'daily-browser.js','/style.css':'style.css'}
+            paths={**{route:'index.html' for route in ('/','/daily','/review','/vocabulary','/import','/practice','/practice/session')},'/app.js':'app.js','/practice-engine.js':'practice-engine.js','/learning-flow.js':'learning-flow.js','/daily-browser.js':'daily-browser.js','/pronunciation.js':'pronunciation.js','/style.css':'style.css'}
             if u.path not in paths: return self.send_json({'error':'页面不存在'},404)
             p=ROOT/'static'/paths[u.path]; self.send_response(200); self.send_header('Content-Type',{'html':'text/html; charset=utf-8','js':'text/javascript; charset=utf-8','css':'text/css; charset=utf-8'}[p.suffix[1:]]); self.end_headers(); self.wfile.write(p.read_bytes())
         except (ValueError,KeyError) as e: self.send_json({'error':str(e)},400)
@@ -99,6 +146,9 @@ class Handler(BaseHTTPRequestHandler):
             n=int(self.headers.get('Content-Length',0))
             if n>5_000_000: raise ValueError('文件过大，请分批导入（5MB 以内）')
             body=json.loads(self.rfile.read(n)); path=urlparse(self.path).path
+            if path=='/api/word':
+                manage_word(body)
+                return self.send_json({'ok':True})
             if path=='/api/preview': return self.send_json(parse(body['text']))
             if path=='/api/import':
                 day=valid_day(body['day']); rows=parse(body['text']); good=[r for r in rows if not r['error']]
@@ -131,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({'error':'接口不存在'},404)
         except (ValueError,KeyError,TypeError,sqlite3.Error) as e: self.send_json({'error':str(e)},400)
 if __name__=='__main__':
-    p=argparse.ArgumentParser(); p.add_argument('--port',type=int,default=8765); p.add_argument('--dictionary'); a=p.parse_args(); init()
+    p=argparse.ArgumentParser(); p.add_argument('--port',type=int,default=8765); p.add_argument('--dictionary'); p.add_argument('--host',default='0.0.0.0',help='监听地址，默认允许局域网访问'); a=p.parse_args(); init()
     if a.dictionary: import_dictionary(a.dictionary)
     else:
-        print(f'Word Journal: http://127.0.0.1:{a.port}',flush=True); ThreadingHTTPServer(('127.0.0.1',a.port),Handler).serve_forever()
+        print(f'Word Journal: http://127.0.0.1:{a.port} (listen {a.host})',flush=True); ThreadingHTTPServer((a.host,a.port),Handler).serve_forever()
